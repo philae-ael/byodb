@@ -2,6 +2,8 @@
 
 #include "common.h"
 
+const usize BTREE_PAGE_SIZE = KB(4);
+
 enum class BTreeNodeType : u16 {
   InternalNode = 1,
   Leaf,

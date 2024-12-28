@@ -18,6 +18,7 @@ endfunction()
 
 add_executable(byodb
   src/main.cpp
+  src/common.cpp
   src/data/btree.cpp
 )
 target_include_directories(byodb PUBLIC src)
