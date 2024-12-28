@@ -1,0 +1,38 @@
+# see https://clang.llvm.org/docs/ClangFormatStyleOptions.html
+---
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: Latest
+
+ColumnLimit: 120
+
+AccessModifierOffset: -2
+IndentWidth: 2
+UseTab: Never
+
+PenaltyReturnTypeOnItsOwnLine: 1000
+
+AlignAfterOpenBracket: BlockIndent
+AlignEscapedNewlines: Left
+AllowAllArgumentsOnNextLine: true
+AllowAllParametersOfDeclarationOnNextLine: false
+AllowShortBlocksOnASingleLine: Always
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortLambdasOnASingleLine: Inline
+AlwaysBreakTemplateDeclarations: true
+BinPackArguments: true
+BinPackParameters: false
+BreakConstructorInitializers: BeforeComma
+IndentPPDirectives: BeforeHash
+PointerAlignment: Left
+AttributeMacros:
+  - defer
+  - PRIVATE
+  - PUBLIC
+  - PRINTF_ATTRIBUTE
+  - EXPORT
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AlignCompound: true
+  AcrossComments: true
