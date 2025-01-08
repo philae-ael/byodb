@@ -1,13 +1,13 @@
 #include "btree.h"
 
 #include "common.h"
+#include "small_vec.h"
 #include <algorithm>
 #include <cassert>
 #include <compare>
 #include <cstring>
 #include <span>
 #include <type_traits>
-#include <utility>
 
 // TODO: Little endian vs big endian
 struct RCursor {
@@ -57,21 +57,16 @@ struct WCursor {
   }
 };
 
-struct BTree {
-  void* userdata;
-  BTreeVTable vtable;
-
-  char* get(u64 node_index) {
-    return vtable.get(userdata, node_index);
-  }
-};
-
 struct KV {
   std::span<const char> key;
   std::span<const char> val;
+
+  usize size() const {
+    return key.size_bytes() + val.size_bytes();
+  }
 };
 
-struct KVArray {
+struct KVArrayView {
   std::span<const u16> offsets;
   const char* data;
 
@@ -93,23 +88,34 @@ struct KVArray {
   }
 
   std::span<const char> as_bytes() const {
+    // Note: this is only true because the KV Array is a view into a node
     return std::span{reinterpret_cast<const char*>(offsets.data()), &*get(offsets.back()).val.end()};
   }
 
-  u16 size() {
+  // Number of kvs
+  u16 size() const {
     return static_cast<u16>(offsets.size());
+  }
+
+  // Size taken if written in memory
+  usize size_bytes() const {
+    return as_bytes().size_bytes();
   }
 };
 
 struct KVArrayList {
-  KVArray cur;
+  KVArrayView cur;
   KVArrayList* next;
 };
 
 struct NodeView {
   BTreeNodeType type;
   u16 nkeys;
-  KVArray kvs;
+  KVArrayView kvs;
+
+  usize size() const {
+    return sizeof(type) + sizeof(nkeys) + kvs.size_bytes();
+  }
 };
 
 NodeView btree_decode_node(RCursor& c) {
@@ -164,7 +170,7 @@ struct NodeWriter {
     WCursor{mem}.write_u16(static_cast<u16>(type));
   }
 
-  static NodeWriter with_header_from(WCursor mem, NodeView& node) {
+  static NodeWriter with_header_from(WCursor mem, const NodeView& node) {
     NodeWriter n(mem, node.type);
 
     switch (node.type) {
@@ -182,7 +188,7 @@ struct NodeWriter {
     WCursor{mem}.skip(sizeof(u16)).write_u16(count);
 
     cur_idx    = 0;
-    cur_offset = header_size();
+    cur_offset = header_size() + count * sizeof(u16); // header + offsets
     return *this;
   }
 
@@ -191,8 +197,10 @@ struct NodeWriter {
   }
 
   NodeWriter& push_KV(KV kv) {
+    // offset
     mem.clone().skip(header_size() + cur_idx * sizeof(u16)).write_u16(cur_offset);
 
+    // kv
     {
       WCursor c{mem};
       c.skip(cur_offset);
@@ -206,7 +214,7 @@ struct NodeWriter {
     return *this;
   }
 
-  NodeWriter& push_KVs(const KVArray& kvs, u16 start_idx, u16 end_idx) {
+  NodeWriter& push_KVs(const KVArrayView& kvs, u16 start_idx, u16 end_idx) {
     for (u16 i = start_idx; i < end_idx; i++) {
       push_KV(kvs[i]);
     }
@@ -244,120 +252,68 @@ NodeView btree_node_replace_kids(WCursor mem, NodeView& node, u16 idx, std::span
   return nw.as_node_view();
 }
 
-template <class T, usize static_storage_length>
-struct small_vec {
-  usize _size     = 0;
-  usize _capacity = static_storage_length;
-  T* _data        = reinterpret_cast<T*>(static_storage);
+// Can split into 2. Node: this does not assure that the second node returned is of size lower than BTREE_PAGE_SIZE
+// BUG: this does allocation and does not disallocate
+small_vec<NodeView, 2> btree_split_node2(BTree& b, const NodeView& old) {
+  u16 cutoff = 0;
+  usize size = sizeof(u16) * 2;
+  for (; cutoff < old.nkeys; cutoff++) {
+    usize additional = sizeof(u16) +           // offset
+                       old.kvs[cutoff].size(); // kv
 
-  union MaybeUninitT {
-    T t;
-  };
+    if (size + additional > BTREE_PAGE_SIZE) {
+      break;
+    }
+    size += additional;
+  }
 
-  MaybeUninitT static_storage[static_storage_length];
+  small_vec<NodeView, 2> ret;
+  if (cutoff == old.nkeys) {
+    /*split into 1*/
+    ret.push_back(old);
+  } else {
+    {
+      auto mem = b.allocate_page();
+      auto w   = NodeWriter::with_header_from(WCursor{mem}, old);
 
-  small_vec() {}
+      w.set_nkeys(cutoff);
+      w.push_KVs(old.kvs, 0, cutoff);
+      ret.push_back(w.as_node_view());
+    }
 
-  template <usize N>
-  small_vec(small_vec<T, N>&& other)
-      : _size(std::exchange(other._size, 0))
-      , _capacity(std::exchange(other._capacity, 0))
-      , _data(std::exchange(other._data, nullptr)) {
-    if (_capacity <= N) {
-      // Move from other's static_storage to our own storage
-      reserve_inner(_capacity);
+    {
+      auto mem = b.allocate_page();
+      auto w   = NodeWriter::with_header_from(WCursor{mem}, old);
+
+      w.set_nkeys(old.nkeys - cutoff);
+      w.push_KVs(old.kvs, cutoff, old.nkeys - cutoff);
+      ret.push_back(w.as_node_view());
+    }
+  }
+  return ret;
+}
+
+// Can split into 3 if the layout is a B c where B is a big chunk of data while a and c are small
+// BUG: this does allocation and does not disallocate
+small_vec<NodeView, 3> btree_split_node3(BTree& b, const NodeView& old) {
+  small_vec<NodeView, 3> ret;
+
+  if (old.size() <= BTREE_PAGE_SIZE) {
+    ret.push_back(old);
+    return ret;
+  }
+
+  auto ret2 = btree_split_node2(b, old);
+  assert(ret2.size() == 2);
+
+  ret.push_back(ret2[0]);
+  if (ret2[1].size() <= BTREE_PAGE_SIZE) {
+    ret.push_back(ret2[1]);
+  } else {
+    for (auto y : btree_split_node2(b, ret2[1])) {
+      ret.push_back(y);
     }
   }
 
-  usize capacity() const {
-    return _capacity;
-  }
-  usize size() const {
-    return _size;
-  }
-
-  // Is in static_storage
-  bool is_small() {
-    return _capacity <= static_storage_length;
-  }
-
-  void reserve(usize size) {
-    if (size <= this->size()) {
-      return;
-    }
-    reserve_inner(size);
-  }
-
-  T* begin() {
-    return _data;
-  }
-  T* end() {
-    return _data + size();
-  }
-
-  void push_back(const T& t) {
-    if (size() == capacity()) {
-      reserve(capacity() * 2);
-    }
-
-    T* loc = &_data[size()];
-    new (loc) T{t};
-    _size += 1;
-  }
-  void pop() {
-    assert(size() > 0);
-
-    back().~T();
-    _size--;
-
-    if (2 * _size < _capacity) {
-      reserve_inner(_size);
-    }
-  }
-
-  auto& at(this auto& self, usize i) {
-    assert(self.size() > i);
-    return self._data[i];
-  }
-  auto& operator[](this auto& self, usize i) {
-    return self.at(i);
-  }
-  auto& front(this auto& self) {
-    assert(self.size() > 0);
-    return self.at(0);
-  }
-  auto& back(this auto& self) {
-    assert(self.size() > 0);
-    return self.at(self.size() - 1);
-  }
-
-  ~small_vec() {
-    for (auto& t : *this) {
-      t.~T();
-    }
-
-    reserve_inner(0);
-  }
-
-private:
-  void reserve_inner(usize size) {
-    T* new_data        = reinterpret_cast<T*>(static_storage);
-    usize new_capacity = static_storage_length;
-    if (size > static_storage_length) {
-      new_data     = new T[size]();
-      new_capacity = size;
-    }
-
-    std::copy(begin(), end(), new_data);
-    if (!is_small()) {
-      delete[] (_data);
-    }
-
-    _data     = new_data;
-    _capacity = new_capacity;
-  }
-};
-
-template struct small_vec<int, 3>;
-
-small_vec<NodeView, 3> btree_split_node(const NodeView& old) {}
+  return ret;
+}
